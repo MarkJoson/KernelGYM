@@ -443,3 +443,346 @@ FastAPI /evaluate --> KernelBenchWorkflowController
     |          v
     +---> EvaluationResponse --> 客户端
 ```
+
+---
+
+## verl Rollout 与 KernelGYM 的交互
+
+### 概述
+
+drkernel 将 KernelGYM 评估服务作为 **外部奖励源** 接入 verl PPO 训练框架。每轮训练的 Rollout 阶段，vLLM 为每条 Prompt 异步生成内核代码；生成完毕后立即调用 `AsyncKernelRewardManager`，后者通过 `KernelRewardClient` 将代码以 HTTP 请求提交给 KernelGYM API Server，轮询评估结果并折算成奖励分数，最终汇入 `token_level_scores`，供 PPO 优势估计（`compute_multi_turn_advantage`）和策略更新使用。
+
+---
+
+### RL 训练层组件
+
+```mermaid
+graph TB
+  subgraph Trainer["KernelPPOTrainer（driver 进程）"]
+    FIT["fit() 主循环"]
+    ADV["compute_multi_turn_advantage"]
+    RFILT["PPOBatchFilter"]
+    UPDATE["actor_rollout_wg / critic_wg 更新"]
+  end
+
+  subgraph AsyncRollout["AsyncLLMEngineManager（Ray Actor）"]
+    MGR["AsyncLLMEngineManager"]
+    ENG["AsyncvLLMEngine x N（每个 DP 分片）"]
+  end
+
+  subgraph RewardMgr["奖励计算层"]
+    ARM["AsyncKernelRewardManager"]
+    KRC["KernelRewardClient"]
+    HW["_HybridHttpWorker（Ray Actor）"]
+    TB["TokenBucketWorker（限速桶）"]
+  end
+
+  subgraph KernelGYM_API["KernelGYM API Server"]
+    API_E["POST /evaluate"]
+    API_S["GET /status/{task_id}"]
+    API_R["GET /results/{task_id}"]
+  end
+
+  FIT -->|"generate_sequences(gen_batch)"| MGR
+  MGR -->|"chunk & scatter"| ENG
+  ENG -->|"_async_rollout_a_prompt"| ARM
+  ARM -->|"compute_kernel_reward_batch"| KRC
+  KRC -->|"submit_and_poll.remote()"| HW
+  HW -->|"acquire token"| TB
+  HW -->|"POST /evaluate"| API_E
+  HW -->|"GET /status/{id}"| API_S
+  HW -->|"GET /results/{id}"| API_R
+  API_R -->|"compiled / correctness / speedup"| HW
+  HW -->|"reward dict"| KRC
+  KRC -->|"calculate_reward_*()"| ARM
+  ARM -->|"reward_tensor + extra_info"| ENG
+  ENG -->|"DataProto (token_level_scores)"| MGR
+  MGR -->|"concat 分片 gen_batch_output"| FIT
+  FIT --> ADV --> RFILT --> UPDATE
+```
+
+---
+
+### 时序图 5：verl PPO 训练主循环（含 KernelGYM 交互）
+
+**一个完整的 PPO Step**，从数据加载到最终参数更新。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant DL   as DataLoader
+  participant TR   as KernelPPOTrainer（fit）
+  participant MR   as AsyncLLMEngineManager
+  participant VE   as AsyncvLLMEngine x N
+  participant KS   as KernelGYM API Server
+  participant ACT  as actor_rollout_wg
+  participant CRIT as critic_wg（可选）
+  participant REF  as ref_policy_wg（可选）
+
+  Note over DL, REF: 阶段 0 — 数据准备
+
+  DL->>TR: batch_dict（prompt + ground_truth + entry_point）
+  TR->>TR: 分配 uid、构造 gen_batch（弹出 input_ids 等）
+  TR->>TR: gen_batch.meta_info["n"] = rollout_n
+
+  Note over DL, REF: 阶段 1 — 异步 Rollout + 内联奖励计算
+
+  TR->>+MR: generate_sequences(gen_batch)
+  MR->>MR: wake_up() 所有 vLLM 实例
+  MR->>MR: chunk(gen_batch)
+  loop 每个 DP 分片
+    MR->>+VE: generate_sequences(chunk)
+    loop 每条 Prompt（asyncio.gather 并发）
+      VE->>VE: vLLM AsyncLLM.generate() 推理
+      VE->>VE: reward_fn() 经 AsyncKernelRewardManager
+      VE->>+KS: POST /evaluate（reference_code + kernel_code）
+      KS-->>-VE: compiled / correctness / speedup / coverage
+      VE->>VE: calculate_reward_*() 折算为 score
+      VE->>VE: reward_tensor[last_token] = score
+    end
+    VE->>VE: _postprocess() 打包 DataProto
+    VE-->>-MR: DataProto（含 token_level_scores）
+  end
+  MR->>MR: DataProto.concat() + sleep()
+  MR-->>-TR: gen_batch_output
+
+  Note over DL, REF: 阶段 2 — 策略/价值函数前向，优势估计
+
+  TR->>TR: uid 对齐过滤（超时丢弃）
+  TR->>TR: batch.union(gen_batch_output)
+
+  alt bypass_old_logprob_for_rollout=False
+    TR->>+ACT: compute_log_prob(batch) -> old_log_probs
+    ACT-->>-TR: old_log_prob DataProto
+    TR->>TR: compute_rollout_correction（IS/RS + coverage RS）
+  else bypass_old_logprob_for_rollout=True（高效模式）
+    TR->>TR: old_log_probs = rollout_log_probs（直接复用）
+  end
+
+  opt use_reference_policy
+    TR->>+REF: compute_ref_log_prob(batch)
+    REF-->>-TR: ref_log_prob DataProto
+  end
+
+  opt use_critic
+    TR->>+CRIT: compute_values(batch)
+    CRIT-->>-TR: values DataProto
+  end
+
+  TR->>TR: apply_loss_mask_to_rewards（padding turn 清零）
+  TR->>TR: compute_multi_turn_advantage（grpo / trloo / egae …）
+
+  Note over DL, REF: 阶段 3 — 过采样过滤与参数更新
+
+  TR->>TR: PPOBatchFilter（rejection sampling / remove_clip）
+  TR->>+ACT: update_actor(batch)
+  ACT-->>-TR: actor_metrics
+
+  opt use_critic
+    TR->>+CRIT: update_critic(batch)
+    CRIT-->>-TR: critic_metrics
+  end
+
+  TR->>TR: 记录 metrics / 检查 early stopping / 保存 checkpoint
+```
+
+---
+
+### 时序图 6：单 Prompt 异步 Rollout + KernelGYM 奖励（细节）
+
+Rollout 阶段中单条 Prompt 从 vLLM 生成到获得奖励的完整细节，对应
+[AsyncvLLMEngine._async_rollout_a_prompt](file:///home/robomaster/Research/KernelGYM/drkernel/kernel/workers/rollout/vllm_rollout/vllm_async_engine.py#592-666)
+与 [AsyncKernelRewardManager.__call__](file:///home/robomaster/Research/KernelGYM/drkernel/kernel/workers/reward_manager/kernel_async.py#191-339)。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant VE  as AsyncvLLMEngine
+  participant LLM as vLLM AsyncLLM（本地）
+  participant RM  as AsyncKernelRewardManager
+  participant KRC as KernelRewardClient
+  participant HW  as _HybridHttpWorker（Ray）
+  participant TB  as TokenBucketWorker
+  participant KS  as KernelGYM API Server
+
+  VE->>VE: apply_chat_template(messages) -> prompt_ids
+  VE->>+LLM: engine.generate(TokensPrompt, SamplingParams)
+  Note right of LLM: vLLM 异步流式推理（response_length tokens）
+  LLM-->>-VE: RequestOutput(text, token_ids, logprobs)
+
+  VE->>VE: 提取 content / response_ids / logprobs
+  VE->>+RM: reward_fn(response_ids, content, ground_truth, entry_point, uuid)
+
+  RM->>RM: extract_kernel_code(content) -> kernel_code
+  RM->>+KRC: compute_kernel_reward_batch([task_dict])
+
+  KRC->>KRC: _preflight_validate（class EntryPoint + class EntryPointNew）
+  alt preflight 失败
+    KRC-->>RM: reward=penalty_score, compiled=False
+  end
+
+  KRC->>KRC: 构造 payload（task_id, reference_code, kernel_code, trials …）
+  KRC->>+HW: submit_and_poll.remote(payload, client_timeout, max_retries)
+
+  HW->>+TB: acquire（等待限速 Token）
+  TB-->>-HW: token acquired
+
+  loop 提交重试（最多 max_retries 次）
+    HW->>+KS: POST /evaluate
+    alt HTTP 200
+      KS-->>HW: accepted
+      HW->>TB: release
+    else HTTP 429 / 503
+      HW->>HW: backoff sleep -> 重试
+    end
+  end
+
+  loop 每 1s 轮询（直到 client_timeout）
+    HW->>+KS: GET /status/{task_id}
+    KS-->>-HW: pending / processing / completed
+  end
+
+  HW->>+KS: GET /results/{task_id}
+  KS-->>-HW: compiled / correctness / speedup / decoy_kernel / metadata
+
+  HW-->>-KRC: raw_result
+
+  KRC->>KRC: calculate_reward_*(raw_result)
+  Note right of KRC: 以 calculate_reward_weighted 为例<br/>未编译  -> compilation_fail_penalty<br/>不正确  -> correctness_fail_penalty<br/>正确    -> correct_w + perf_w * is_speedup_pos<br/>       + coverage_w * coverage
+
+  KRC->>KRC: compute_coverage_reward -> num/time coverage
+  KRC->>KRC: _merge_reward_result -> merged
+  KRC-->>-RM: [merged_result]
+
+  RM->>RM: 检查 speedup > speedup_reward_upper_bound
+  opt 异常 speedup
+    RM->>KRC: 重新评估
+  end
+
+  RM->>RM: reward_tensor[last_token_idx] = score
+  RM->>RM: reward_extra_info（correctness / speedup / coverage …）
+  RM-->>-VE: reward_tensor + reward_extra_info
+
+  VE->>VE: AgentLoopOutput 打包（含 logprobs + reward_tensor）
+```
+
+---
+
+### 时序图 7：批量奖励并发与限速控制
+
+多路 Prompt 并发提交 KernelGYM 时，[KernelRewardClient.compute_batch_rewards](file:///home/robomaster/Research/KernelGYM/drkernel/kernel/rewards/reward_client.py#554-755) 通过 Ray 对象引用实现全并发，`TokenBucketWorker` 控制瞬时 QPS。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant KRC as KernelRewardClient
+  participant HW  as _HybridHttpWorker（Ray, max_concurrency=N）
+  participant TB  as TokenBucketWorker（全局限速桶）
+  participant KS  as KernelGYM API Server
+
+  Note over KRC, KS: 批次大小 = B
+
+  loop 对每条任务 i = 1..B
+    KRC->>HW: submit_and_poll.remote(payload_i) -> obj_ref_i
+    Note right of KRC: 不阻塞，立即进入下一条
+  end
+
+  Note over KRC, KS: asyncio + ray.wait 循环等待
+
+  loop ray.wait(remaining, timeout=60s)
+    alt 有任务完成
+      KRC->>KRC: ray.get(ref) -> raw_result
+      KRC->>KRC: reward_func(raw) -> merged[orig_idx]
+    else 60s 心跳超时
+      KRC->>KRC: 打印进度（completed/total, tokens_in_use, pending ids）
+    end
+  end
+
+  Note over HW, TB: 每个 submit_and_poll 内部
+
+  HW->>+TB: acquire
+  TB-->>-HW: token
+  HW->>+KS: POST /evaluate
+  KS-->>-HW: 200 OK
+  HW->>TB: release（立即释放，不等轮询）
+
+  loop 每 1s
+    HW->>KS: GET /status/{id}
+    HW->>KS: GET /results/{id}（completed 后）
+  end
+
+  KRC->>KRC: 还原原始顺序（prefilled -> results -> fallback penalty）
+  KRC-->>KRC: return merged[0..B-1]
+```
+
+---
+
+### 关键架构决策（RL 训练层）
+
+| 决策 | 设计依据 |
+|------|----------|
+| **奖励内联于 Rollout**（非独立 reward_fn 阶段） | vLLM 生成完毕后立即在同一 asyncio Task 内调用 `AsyncKernelRewardManager`，将 `token_level_scores` 直接写入 `DataProto`，避免 Trainer 侧再发起一轮 RPC 拉取数据。 |
+| **Ray Actor 作为 HTTP Worker 池** | `_HybridHttpWorker` 以 `max_concurrency=N` 部署为单个 Ray Actor，所有 httpx 连接复用；与 `TokenBucketWorker` 协同实现 QPS 限速。 |
+| **两级超时设计**（`task_timeout` + `task_timeout_in_client`） | `task_timeout` 传入 KernelGYM 控制内核执行上限；`task_timeout_in_client` 是客户端轮询总时限，须 >= `task_timeout`，防止 Trainer 在 QPS 高峰时无限阻塞。 |
+| **Preflight 校验** | 提交前检查 `class EntryPoint` / `class EntryPointNew` 是否存在，无效代码直接返回 penalty，节省 KernelGYM GPU 资源。 |
+| **异常 Speedup 重评** | 若 `speedup > speedup_reward_upper_bound`，自动重评一次，防止 GPU 计时噪声污染训练信号。 |
+| **`bypass_old_logprob_for_rollout`** | 启用后用 `rollout_log_probs` 直接替代 `old_log_probs`，跳过额外 Actor 前向，显著降低单 Step 时延。 |
+| **Coverage 奖励扩展** | 从 KernelGYM profiling metadata 提取自定义 kernel 覆盖率（数量/时间），叠加到正确性/性能奖励，引导模型覆盖更多计算路径。 |
+| **Coverage Rejection Sampling** | `compute_coverage_rejection_mask` 额外过滤覆盖率不达标的正确样本，防止低覆盖的"取巧"解法混入策略更新。 |
+
+---
+
+## RL 训练数据流概览
+
+```
+DataLoader（JSONL Prompt + ground_truth）
+    |
+    v
+KernelPPOTrainer.fit() -- 构造 gen_batch
+    |
+    v
+AsyncLLMEngineManager.generate_sequences()
+    |   <- chunk 分片到各 DP 节点
+    v
+AsyncvLLMEngine._async_rollout_a_prompt() x B x n（并发）
+    |
+    +--[vLLM 推理]--> response_ids + logprobs
+    |
+    +--[内联奖励]--> AsyncKernelRewardManager
+                          |
+                     KernelRewardClient
+                          |
+                   _HybridHttpWorker（Ray）
+                          |
+               +----------+-----------+
+               |                      |
+          POST /evaluate        GET /status
+          GET /results           （轮询）
+               |
+      KernelGYM API Server（见时序图 1）
+               |
+      compiled / correctness / speedup / coverage
+               |
+      calculate_reward_*() -> reward_score
+               |
+    reward_tensor[last_token] = score
+    token_level_scores 写入 DataProto
+    |
+    v
+KernelPPOTrainer -- 汇聚所有 DP 分片
+    |
+    v
+old_log_prob / ref_log_prob / values（FSDP Worker 前向）
+    |
+    v
+compute_multi_turn_advantage（grpo / trloo / egae …）
+    |
+    v
+PPOBatchFilter（rejection sampling / oversampling 裁剪）
+    |
+    v
+actor_rollout_wg.update_actor() + critic_wg.update_critic()
+    |
+    v
+checkpoint / metrics / early stopping
+```
