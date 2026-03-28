@@ -273,7 +273,7 @@ sequenceDiagram
   participant PW as PersistentWorker
   participant TQ as task_queue（mp.Queue）
   participant RQ as result_queue（mp.Queue）
-  participant Loop as worker_loop（子进程）
+  participant Loopw as worker_loop（子进程）
   participant TK as Toolkit.evaluate
   participant BE as Backend
   participant GPU as GPU
@@ -291,19 +291,19 @@ sequenceDiagram
 
     PW->>TQ: put(task_data)
 
-    Note right of Loop: 子进程从队列中拾取任务
+    Note right of Loopw: 子进程从队列中拾取任务
 
-    Loop->>TQ: get() task_data
-    Loop->>Loop: 从缓存解析 toolkit 和 backend
-    Loop->>+TK: toolkit.evaluate(task_data, backend)
+    Loopw->>TQ: get() task_data
+    Loopw->>Loopw: 从缓存解析 toolkit 和 backend
+    Loopw->>+TK: toolkit.evaluate(task_data, backend)
     TK->>+BE: compile then load then run
     BE->>GPU: CUDA execution
     GPU-->>BE: results
     BE-->>-TK: exec_result
-    TK-->>-Loop: result_dict
+    TK-->>-Loopw: result_dict
 
-    Loop->>Loop: _aggressive_gpu_cleanup(device_id)
-    Loop->>RQ: put(success=true, result=result_dict)
+    Loopw->>Loopw: _aggressive_gpu_cleanup(device_id)
+    Loopw->>RQ: put(success=true, result=result_dict)
 
     PW->>RQ: get(timeout) result
     PW->>PW: tasks_processed++
